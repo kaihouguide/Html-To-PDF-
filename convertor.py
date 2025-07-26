@@ -3,21 +3,22 @@ import os
 import sys
 import aiohttp
 import aiofiles
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError
 from PIL import Image
 from pypdf import PdfWriter
-
-# Allow Pillow to handle large images without raising a DecompressionBombError
-Image.MAX_IMAGE_PIXELS = None
+from io import BytesIO
 
 # --- Configuration ---
+Image.MAX_IMAGE_PIXELS = None
+PIXEL_LIMIT_PER_STRIP = 65000
 PARALLEL_JOBS = 4
 QUALITY_MULTIPLIER = 2
 CACHE_DIR = "script_cache"
 VIEWPORT_HEIGHT = 1200
-PIXEL_LIMIT_PER_STRIP = 65000 # A safe limit, slightly less than the theoretical max
+# A very generous timeout for the screenshot command itself, for very slow pages.
+SCREENSHOT_TIMEOUT = 180000  # 3 minutes
 
-# --- Dependencies to be cached locally ---
+# --- Dependencies ---
 DEPENDENCIES = {
     "https://cdn.plot.ly/plotly-2.32.0.min.js": "plotly.js",
     "https://d3js.org/d3.v7.min.js": "d3.js",
@@ -27,6 +28,7 @@ DEPENDENCIES = {
 
 async def ensure_dependencies_cached():
     """Checks if JavaScript dependencies are cached and downloads them if not."""
+    print("--- Checking Dependencies ---")
     os.makedirs(CACHE_DIR, exist_ok=True)
     async with aiohttp.ClientSession() as session:
         for url, filename in DEPENDENCIES.items():
@@ -34,7 +36,7 @@ async def ensure_dependencies_cached():
             if not os.path.exists(local_path):
                 print(f"'{filename}' not found. Downloading...")
                 try:
-                    async with session.get(url) as response:
+                    async with session.get(url, timeout=60) as response:
                         response.raise_for_status()
                         content = await response.read()
                         async with aiofiles.open(local_path, 'wb') as f:
@@ -43,31 +45,62 @@ async def ensure_dependencies_cached():
                 except Exception as e:
                     print(f"  ❌ Failed to download '{filename}': {e}")
                     return False
+    print("--- Dependency check complete. ---")
     return True
+
+
+async def wait_for_page_to_load(page, base_filename):
+    """Contains the robust waiting logic for all dynamic content to finish loading."""
+    total_height = await page.evaluate("document.body.scrollHeight")
+    for i in range(0, total_height, VIEWPORT_HEIGHT):
+        await page.evaluate(f"window.scrollTo(0, {i})")
+        await page.wait_for_timeout(100)
+    await page.evaluate("window.scrollTo(0, 0)")
+
+    try:
+        await page.wait_for_load_state('networkidle', timeout=30000)
+    except TimeoutError:
+        print(f"  - Note: Network idle timed out for {base_filename}.")
+    try:
+        await page.wait_for_function("typeof MathJax?.startup?.promise.then(p => p && p.done) !== 'undefined'", timeout=60000)
+    except TimeoutError:
+        print(f"  - Warning: MathJax timed out for {base_filename}.")
+    try:
+        await page.wait_for_function(
+            """() => {
+                const plots = Array.from(document.querySelectorAll('.js-plotly-plot'));
+                return !plots.length || plots.every(p => p.querySelector('.main-svg') && p.querySelector('.main-svg').clientHeight > 10);
+            }""",
+            timeout=60000
+        )
+    except TimeoutError:
+        if await page.query_selector('.js-plotly-plot'):
+            print(f"  - Warning: Plotly timed out for {base_filename}.")
+    await page.wait_for_timeout(1000)
 
 
 async def process_single_file(index, total, semaphore, browser, html_file_path, output_directory, cached_urls):
     """
-    Processes one HTML file: takes scrolling screenshots, stitches them into
-    long strips (chunked to avoid image size limits), and merges them into a
-    single, multi-page "long strip" PDF.
+    Processes one HTML file, with an extremely patient timeout for screenshots
+    and a robust fallback for very long pages.
     """
     async with semaphore:
         base_filename = os.path.splitext(os.path.basename(html_file_path))[0]
         final_pdf_path = os.path.join(output_directory, f"{base_filename}.pdf")
-        print(f"▶️ [{index}/{total}] Processing: {os.path.basename(html_file_path)}")
 
-        image_paths = []
-        temp_pdf_paths = []
-        context = None
-        page = None
+        if os.path.exists(final_pdf_path):
+            print(f"⏭️  [{index}/{total}] Skipping (already exists): {os.path.basename(final_pdf_path)}")
+            return
+
+        print(f"▶️  [{index}/{total}] Processing: {os.path.basename(html_file_path)}")
+        context, page = None, None
         try:
             context = await browser.new_context(
                 viewport={"width": 1280, "height": VIEWPORT_HEIGHT},
                 device_scale_factor=QUALITY_MULTIPLIER
             )
             page = await context.new_page()
-
+            
             async def handle_route(route):
                 if route.request.url in cached_urls:
                     await route.fulfill(path=os.path.join(CACHE_DIR, DEPENDENCIES[route.request.url]))
@@ -75,70 +108,74 @@ async def process_single_file(index, total, semaphore, browser, html_file_path, 
                     await route.continue_()
 
             await page.route("**/*", handle_route)
-            await page.goto(f'file://{html_file_path}', wait_until='networkidle', timeout=90000)
+            await page.goto(f'file://{html_file_path}', wait_until='domcontentloaded', timeout=90000)
+            await wait_for_page_to_load(page, base_filename)
 
-            total_height = await page.evaluate("() => document.body.scrollHeight")
-            num_screenshots = (total_height + VIEWPORT_HEIGHT - 1) // VIEWPORT_HEIGHT
+            try:
+                # STRATEGY 1: Attempt fast, full-page screenshot with long timeout
+                png_data = await page.screenshot(full_page=True, timeout=SCREENSHOT_TIMEOUT)
+                with Image.open(BytesIO(png_data)) as img:
+                    img.save(final_pdf_path, "PDF", resolution=100.0)
+                print(f"  ✅ Created full-page PDF: {os.path.basename(final_pdf_path)}")
 
-            for i in range(num_screenshots):
-                offset = i * VIEWPORT_HEIGHT
-                await page.evaluate(f"window.scrollTo(0, {offset})")
-                await asyncio.sleep(0.1)
-                temp_path = os.path.join(output_directory, f"{base_filename}_part{i}.png")
-                await page.screenshot(path=temp_path)
-                image_paths.append(temp_path)
-
-            if image_paths:
-                images = [Image.open(p) for p in image_paths]
-                strip_width = images[0].width
-                img_height = images[0].height
-                imgs_per_strip = PIXEL_LIMIT_PER_STRIP // img_height
-                image_chunks = [images[i:i + imgs_per_strip] for i in range(0, len(images), imgs_per_strip)]
-
-                for i, chunk in enumerate(image_chunks):
-                    chunk_height = sum(img.height for img in chunk)
-                    long_strip = Image.new('RGB', (strip_width, chunk_height))
-                    y_offset = 0
-                    for img in chunk:
-                        long_strip.paste(img, (0, y_offset))
-                        y_offset += img.height
+            except Exception as e:
+                # STRATEGY 2: Fallback for very long pages
+                if "Maximum supported image dimension" in str(e) or "broken data stream" in str(e):
+                    print(f"  - Note: Page is too long, falling back to stitching method for {base_filename}.")
                     
-                    temp_pdf_path = os.path.join(output_directory, f"{base_filename}_temp_strip_{i}.pdf")
-                    long_strip.save(temp_pdf_path, "PDF", resolution=100.0)
-                    temp_pdf_paths.append(temp_pdf_path)
+                    image_data_list = []
+                    total_height = await page.evaluate("document.body.scrollHeight")
+                    for i, offset in enumerate(range(0, total_height, VIEWPORT_HEIGHT)):
+                        print(f"    -> Capturing chunk {i+1}...")
+                        await page.evaluate(f"window.scrollTo(0, {offset})")
+                        await page.wait_for_timeout(50)
+                        # Use the same long timeout for each chunk
+                        image_data_list.append(await page.screenshot(timeout=SCREENSHOT_TIMEOUT))
 
-                for img in images:
-                    img.close()
+                    images = [Image.open(BytesIO(data)) for data in image_data_list]
+                    
+                    pdf_merger = PdfWriter()
+                    current_strip_height = 0
+                    current_strip_images = []
 
-                pdf_merger = PdfWriter()
-                for path in temp_pdf_paths:
-                    pdf_merger.append(path)
-                with open(final_pdf_path, 'wb') as f:
-                    pdf_merger.write(f)
-                pdf_merger.close()
-                print(f"  ✅ Created merged long-strip PDF: {os.path.basename(final_pdf_path)}")
+                    for img in images:
+                        if current_strip_height + img.height > PIXEL_LIMIT_PER_STRIP:
+                            strip = Image.new('RGB', (img.width, current_strip_height))
+                            y = 0
+                            for part in current_strip_images: strip.paste(part, (0, y)); y += part.height
+                            with BytesIO() as pdf_buffer:
+                                strip.save(pdf_buffer, "PDF", resolution=100.0)
+                                pdf_merger.append(BytesIO(pdf_buffer.getvalue()))
+                            current_strip_images, current_strip_height = [img], img.height
+                        else:
+                            current_strip_images.append(img); current_strip_height += img.height
+
+                    if current_strip_images:
+                        strip = Image.new('RGB', (images[0].width, current_strip_height))
+                        y = 0
+                        for part in current_strip_images: strip.paste(part, (0, y)); y += part.height
+                        with BytesIO() as pdf_buffer:
+                            strip.save(pdf_buffer, "PDF", resolution=100.0)
+                            pdf_merger.append(BytesIO(pdf_buffer.getvalue()))
+                    
+                    with open(final_pdf_path, 'wb') as f: pdf_merger.write(f)
+                    pdf_merger.close()
+                    print(f"  ✅ Created stitched PDF: {os.path.basename(final_pdf_path)}")
+                else:
+                    raise e
 
         except Exception as e:
-            print(f"  ❌ Error processing {base_filename}: {e}")
+            print(f"  ❌ An unexpected error occurred while processing {base_filename}: {e}")
         finally:
             if page: await page.close()
             if context: await context.close()
-            for path in image_paths + temp_pdf_paths:
-                if os.path.exists(path):
-                    os.remove(path)
 
 
 async def main():
-    """Main function to orchestrate the conversion process."""
-    # --- MODIFIED: Read path from command-line argument ---
     if len(sys.argv) < 2:
-        print("❌ Error: No folder path provided.")
-        print("   Usage: python code(15).py \"C:\\path\\to\\your\\html_files\"")
+        print(f"❌ Error: No folder path provided.\n   Usage: python {os.path.basename(__file__)} \"C:\\path\\to\\html_files\"")
         return
-
     directory_path = sys.argv[1]
-    # --- END OF MODIFICATION ---
-
     if not os.path.isdir(directory_path):
         print(f"❌ Invalid path: '{directory_path}' is not a valid folder.")
         return
