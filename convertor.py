@@ -15,6 +15,7 @@ PARALLEL_JOBS = 4
 QUALITY_MULTIPLIER = 2
 CACHE_DIR = "script_cache"
 VIEWPORT_HEIGHT = 1200
+CHUNK_OVERLAP = 20  # Fix for misalignment in fallback stitching
 # A very generous timeout for the screenshot command itself, for very slow pages.
 SCREENSHOT_TIMEOUT = 180000  # 3 minutes
 
@@ -27,7 +28,6 @@ DEPENDENCIES = {
 
 
 async def ensure_dependencies_cached():
-    """Checks if JavaScript dependencies are cached and downloads them if not."""
     print("--- Checking Dependencies ---")
     os.makedirs(CACHE_DIR, exist_ok=True)
     async with aiohttp.ClientSession() as session:
@@ -50,7 +50,6 @@ async def ensure_dependencies_cached():
 
 
 async def wait_for_page_to_load(page, base_filename):
-    """Contains the robust waiting logic for all dynamic content to finish loading."""
     total_height = await page.evaluate("document.body.scrollHeight")
     for i in range(0, total_height, VIEWPORT_HEIGHT):
         await page.evaluate(f"window.scrollTo(0, {i})")
@@ -80,10 +79,6 @@ async def wait_for_page_to_load(page, base_filename):
 
 
 async def process_single_file(index, total, semaphore, browser, html_file_path, output_directory, cached_urls):
-    """
-    Processes one HTML file, with an extremely patient timeout for screenshots
-    and a robust fallback for very long pages.
-    """
     async with semaphore:
         base_filename = os.path.splitext(os.path.basename(html_file_path))[0]
         final_pdf_path = os.path.join(output_directory, f"{base_filename}.pdf")
@@ -119,46 +114,53 @@ async def process_single_file(index, total, semaphore, browser, html_file_path, 
                 print(f"  ✅ Created full-page PDF: {os.path.basename(final_pdf_path)}")
 
             except Exception as e:
-                # STRATEGY 2: Fallback for very long pages
+                # STRATEGY 2: Fallback for very long pages (misalignment fix applied)
                 if "Maximum supported image dimension" in str(e) or "broken data stream" in str(e):
                     print(f"  - Note: Page is too long, falling back to stitching method for {base_filename}.")
                     
-                    image_data_list = []
+                    image_chunks = []
                     total_height = await page.evaluate("document.body.scrollHeight")
-                    for i, offset in enumerate(range(0, total_height, VIEWPORT_HEIGHT)):
+                    for i, offset in enumerate(range(0, total_height, VIEWPORT_HEIGHT - CHUNK_OVERLAP)):
                         print(f"    -> Capturing chunk {i+1}...")
                         await page.evaluate(f"window.scrollTo(0, {offset})")
-                        await page.wait_for_timeout(50)
-                        # Use the same long timeout for each chunk
-                        image_data_list.append(await page.screenshot(timeout=SCREENSHOT_TIMEOUT))
+                        await page.wait_for_timeout(150)  # more settle time
+                        chunk_data = await page.screenshot(timeout=SCREENSHOT_TIMEOUT)
+                        with Image.open(BytesIO(chunk_data)) as img:
+                            if i > 0:
+                                img = img.crop((0, CHUNK_OVERLAP, img.width, img.height))
+                            image_chunks.append(img.copy())
 
-                    images = [Image.open(BytesIO(data)) for data in image_data_list]
-                    
                     pdf_merger = PdfWriter()
                     current_strip_height = 0
                     current_strip_images = []
 
-                    for img in images:
+                    for img in image_chunks:
                         if current_strip_height + img.height > PIXEL_LIMIT_PER_STRIP:
                             strip = Image.new('RGB', (img.width, current_strip_height))
                             y = 0
-                            for part in current_strip_images: strip.paste(part, (0, y)); y += part.height
+                            for part in current_strip_images:
+                                strip.paste(part, (0, y))
+                                y += part.height
                             with BytesIO() as pdf_buffer:
                                 strip.save(pdf_buffer, "PDF", resolution=100.0)
                                 pdf_merger.append(BytesIO(pdf_buffer.getvalue()))
                             current_strip_images, current_strip_height = [img], img.height
                         else:
-                            current_strip_images.append(img); current_strip_height += img.height
+                            current_strip_images.append(img)
+                            current_strip_height += img.height
 
                     if current_strip_images:
-                        strip = Image.new('RGB', (images[0].width, current_strip_height))
+                        strip = Image.new('RGB', (image_chunks[0].width, current_strip_height))
                         y = 0
-                        for part in current_strip_images: strip.paste(part, (0, y)); y += part.height
+                        for part in current_strip_images:
+                            strip.paste(part, (0, y))
+                            y += part.height
                         with BytesIO() as pdf_buffer:
                             strip.save(pdf_buffer, "PDF", resolution=100.0)
                             pdf_merger.append(BytesIO(pdf_buffer.getvalue()))
                     
-                    with open(final_pdf_path, 'wb') as f: pdf_merger.write(f)
+                    with open(final_pdf_path, 'wb') as f:
+                        pdf_merger.write(f)
                     pdf_merger.close()
                     print(f"  ✅ Created stitched PDF: {os.path.basename(final_pdf_path)}")
                 else:
@@ -167,8 +169,10 @@ async def process_single_file(index, total, semaphore, browser, html_file_path, 
         except Exception as e:
             print(f"  ❌ An unexpected error occurred while processing {base_filename}: {e}")
         finally:
-            if page: await page.close()
-            if context: await context.close()
+            if page:
+                await page.close()
+            if context:
+                await context.close()
 
 
 async def main():
